@@ -1,0 +1,72 @@
+#!/usr/bin/stap -g
+
+%{
+#include <asm/msr.h>
+#include <asm/intel-family.h>
+%}
+
+// 80 cpus on this particular server
+global prev_aperf[80]
+global prev_mperf[80]
+global prev_tsc[80]
+global seen[80]
+
+// base frequency of this CPU Xeon E5-2698 v4 is 2200 MHz
+global base_freq = 2200
+
+// Definitions
+//
+// base frequency : max non turbo frequency.
+// APERF          : counter spinning at actual core frequency. Stops at idle.
+// MPERF          : counter spinning at base frequency. Stops at idle.
+// TSC            : exactly like MPERF but doesn’t stop at idle.
+//
+// Formulas
+//
+// Avg_MHz        = delta_APERF / delta_time = delta_APERF * base_freq / delta_TSC
+// Busy_Fraction  = delta_MPERF / delta_TSC
+// Busy_MHz       = delta_APERF / delta_MPERF * base_freq
+
+probe kernel.trace("power:cpu_frequency") {
+	// Note: target variables from this tracepoint are
+	// $frequency and $cpu_id
+	// see sources at include/trace/events/power.h
+	aperf = read_aperf();
+	mperf = read_mperf();
+	tsc = read_tsc();
+	cpu = $cpu_id;
+	if (seen[cpu]) {
+		delta_aperf = aperf - prev_aperf[cpu];
+		delta_mperf = mperf - prev_mperf[cpu];
+		delta_tsc = tsc - prev_tsc[cpu];
+
+		timestamp = cpu_clock_us(cpu);
+		busy_khz = (delta_aperf << 10) / delta_mperf * base_freq;
+		avg_khz = (delta_aperf << 10) / delta_tsc * base_freq;
+		busy_fraction = (delta_mperf << 10) / delta_tsc;
+		printf("cpu: %d, timestamp: %d  busy KHz: %d, avg KHz: %d, busy_fraction (0-1024): %d, requested freq: %d\n",
+			cpu, timestamp, busy_khz, avg_khz, busy_fraction, $frequency);
+	}
+	prev_aperf[cpu] = aperf;
+	prev_mperf[cpu] = mperf;
+	prev_tsc[cpu] = tsc;
+	seen[cpu] = 1;
+}
+
+function read_aperf:long() %{
+	u64 aperf;
+	rdmsrl(MSR_IA32_APERF, aperf);
+	STAP_RETURN(aperf);
+%}
+
+function read_mperf:long() %{
+	u64 mperf;
+	rdmsrl(MSR_IA32_MPERF, mperf);
+	STAP_RETURN(mperf);
+%}
+
+function read_tsc:long() %{
+	unsigned int low, high;
+	asm volatile("rdtsc" : "=a" (low), "=d" (high));
+	STAP_RETURN(low | ((unsigned long long)high) << 32);
+%}
